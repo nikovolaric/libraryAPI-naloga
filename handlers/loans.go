@@ -1,10 +1,10 @@
 package handlers
 
 import (
+	"time"
+
 	"libraryAPI/db"
 	"libraryAPI/models"
-
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -28,28 +28,36 @@ type BookLoanResponse struct {
 }
 
 func GetAllBookLoans(c *gin.Context) {
-	var loans []BookLoanResponse
+	loans := []BookLoanResponse{}
 
-	rows, err := db.DB.Query("SELECT l.id, l.borrow_date, l.return_date, u.id, u.first_name, u.last_name, b.id, b.title FROM loans l JOIN users u ON u.id=l.user_id JOIN books b ON b.id=l.book_id")
-
+	rows, err := db.DB.QueryContext(c.Request.Context(),
+		`SELECT l.id, l.borrow_date, l.return_date,
+		        u.id, u.first_name, u.last_name,
+		        b.id, b.title
+		 FROM loans l
+		 JOIN users u ON u.id = l.user_id
+		 JOIN books b ON b.id = l.book_id`)
 	if err != nil {
-
-		c.JSON(500, gin.H{"error": "Something went wrong in query."})
+		c.JSON(500, gin.H{"error": "could not fetch loans"})
 		return
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var loan BookLoanResponse
-
-		if err := rows.Scan(&loan.ID, &loan.BorrowDate, &loan.ReturnDate, &loan.User.ID, &loan.User.FirstName, &loan.User.LastName, &loan.Book.ID, &loan.Book.Title); err != nil {
-			c.JSON(500, gin.H{"error": "Something went wrong in scan."})
+		if err := rows.Scan(
+			&loan.ID, &loan.BorrowDate, &loan.ReturnDate,
+			&loan.User.ID, &loan.User.FirstName, &loan.User.LastName,
+			&loan.Book.ID, &loan.Book.Title,
+		); err != nil {
+			c.JSON(500, gin.H{"error": "could not read loan"})
+			return
 		}
 		loans = append(loans, loan)
 	}
 
 	if err := rows.Err(); err != nil {
-
-		c.JSON(500, gin.H{"error": "Something went wrong."})
+		c.JSON(500, gin.H{"error": "could not fetch loans"})
 		return
 	}
 
@@ -58,8 +66,8 @@ func GetAllBookLoans(c *gin.Context) {
 
 func NewLoan(c *gin.Context) {
 	var req struct {
-		BookID string `json:"book_id"`
-		UserID string `json:"user_id"`
+		BookID string `json:"book_id" binding:"required"`
+		UserID string `json:"user_id" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -67,48 +75,104 @@ func NewLoan(c *gin.Context) {
 		return
 	}
 
+	bookID, err := uuid.Parse(req.BookID)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid book_id"})
+		return
+	}
+
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid user_id"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Decrementing availability and inserting the loan must be atomic:
+	// a crash between the two would otherwise leak a copy.
+	tx, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "could not start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
+		"UPDATE books SET available = available - 1 WHERE id = $1 AND available > 0",
+		bookID)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "could not update book"})
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		c.JSON(400, gin.H{"error": "book not found or not available"})
+		return
+	}
+
 	loan := models.BookLoan{
 		ID:         uuid.New(),
-		BookID:     uuid.MustParse(req.BookID),
-		UserID:     uuid.MustParse(req.UserID),
+		BookID:     bookID,
+		UserID:     userID,
 		BorrowDate: time.Now(),
 	}
 
-	rows, err := db.DB.Exec("UPDATE books SET available=available-1 WHERE id=$1 AND available > 0", loan.BookID)
-
-	if no, _ := rows.RowsAffected(); no == 0 {
-		c.JSON(400, gin.H{"message": "Book not found or not available."})
+	if _, err := tx.ExecContext(ctx,
+		"INSERT INTO loans (id, user_id, book_id, borrow_date) VALUES ($1, $2, $3, $4)",
+		loan.ID, loan.UserID, loan.BookID, loan.BorrowDate); err != nil {
+		// Most likely an unknown user_id (foreign key violation).
+		c.JSON(400, gin.H{"error": "could not create loan, check user_id"})
 		return
 	}
 
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Something went wrong."})
+	if err := tx.Commit(); err != nil {
+		c.JSON(500, gin.H{"error": "could not commit transaction"})
 		return
 	}
-
-	db.DB.Exec("INSERT INTO loans (id,user_id,book_id,borrow_date) VALUES ($1,$2,$3,$4)", loan.ID, loan.UserID, loan.BookID, loan.BorrowDate)
 
 	c.JSON(201, loan)
-
 }
 
 func ReturnLoan(c *gin.Context) {
-	id := c.Param("id")
-
-	loan, _ := db.DB.Exec("UPDATE loans SET return_date=$2 WHERE id=$1 AND return_date IS NULL", uuid.MustParse(id), time.Now())
-
-	if no, _ := loan.RowsAffected(); no == 0 {
-		c.JSON(400, gin.H{"message": "Book was already returned."})
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(400, gin.H{"error": "invalid loan id"})
 		return
 	}
 
-	book, _ := db.DB.Exec("UPDATE books SET available=available+1 WHERE id=(SELECT book_id FROM loans WHERE id=$1)", uuid.MustParse(id))
+	ctx := c.Request.Context()
 
-	if no, _ := book.RowsAffected(); no == 0 {
-		c.JSON(400, gin.H{"message": "Book was already returned."})
+	// Closing the loan and returning the copy must be atomic.
+	tx, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "could not start transaction"})
+		return
+	}
+	defer tx.Rollback()
+
+	res, err := tx.ExecContext(ctx,
+		"UPDATE loans SET return_date = $2 WHERE id = $1 AND return_date IS NULL",
+		id, time.Now())
+	if err != nil {
+		c.JSON(500, gin.H{"error": "could not update loan"})
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		c.JSON(400, gin.H{"error": "loan not found or already returned"})
 		return
 	}
 
-	c.JSON(200, gin.H{"status": "Book returned."})
+	if _, err := tx.ExecContext(ctx,
+		"UPDATE books SET available = available + 1 WHERE id = (SELECT book_id FROM loans WHERE id = $1)",
+		id); err != nil {
+		c.JSON(500, gin.H{"error": "could not update book"})
+		return
+	}
 
+	if err := tx.Commit(); err != nil {
+		c.JSON(500, gin.H{"error": "could not commit transaction"})
+		return
+	}
+
+	c.JSON(200, gin.H{"status": "book returned"})
 }

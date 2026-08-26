@@ -1,0 +1,7 @@
+# env
+.env
+devops/.env
+
+# build
+/libraryAPI
+*.exe

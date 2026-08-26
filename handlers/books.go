@@ -8,10 +8,16 @@ import (
 	"github.com/google/uuid"
 )
 
+type AvailableBook struct {
+	ID        uuid.UUID `json:"id"`
+	Title     string    `json:"title"`
+	Available int       `json:"available"`
+}
+
 func CreateBook(c *gin.Context) {
 	var req struct {
-		Title string `json:"title"`
-		Total int    `json:"total"`
+		Title string `json:"title" binding:"required"`
+		Total int    `json:"total" binding:"required,gte=1"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -26,34 +32,38 @@ func CreateBook(c *gin.Context) {
 		Available: req.Total,
 	}
 
-	db.DB.Exec("INSERT INTO books (id, title, total, available) VALUES ($1, $2, $3, $4)", book.ID, book.Title, book.Total, book.Available)
+	if _, err := db.DB.ExecContext(c.Request.Context(),
+		"INSERT INTO books (id, title, total, available) VALUES ($1, $2, $3, $4)",
+		book.ID, book.Title, book.Total, book.Available); err != nil {
+		c.JSON(500, gin.H{"error": "could not create book"})
+		return
+	}
 
 	c.JSON(201, book)
-
 }
 
 func GetAllBooks(c *gin.Context) {
-	var books []models.Book
+	books := []models.Book{}
 
-	rows, err := db.DB.Query("SELECT * FROM books")
-
+	rows, err := db.DB.QueryContext(c.Request.Context(),
+		"SELECT id, title, total, available FROM books")
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Something went wrong."})
+		c.JSON(500, gin.H{"error": "could not fetch books"})
 		return
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var book models.Book
 		if err := rows.Scan(&book.ID, &book.Title, &book.Total, &book.Available); err != nil {
-			c.JSON(500, gin.H{"error": "Something went wrong."})
+			c.JSON(500, gin.H{"error": "could not read book"})
 			return
-
 		}
 		books = append(books, book)
 	}
 
 	if err := rows.Err(); err != nil {
-		c.JSON(500, gin.H{"error": "Something went wrong."})
+		c.JSON(500, gin.H{"error": "could not fetch books"})
 		return
 	}
 
@@ -61,37 +71,29 @@ func GetAllBooks(c *gin.Context) {
 }
 
 func GetAllAvailableBooks(c *gin.Context) {
-	var books []struct {
-		ID        uuid.UUID
-		Title     string
-		Available int
-	}
+	books := []AvailableBook{}
 
-	rows, err := db.DB.Query("SELECT id, title, available FROM books WHERE available != 0")
-
+	rows, err := db.DB.QueryContext(c.Request.Context(),
+		"SELECT id, title, available FROM books WHERE available > 0")
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Something went wrong."})
+		c.JSON(500, gin.H{"error": "could not fetch books"})
 		return
 	}
+	defer rows.Close()
 
 	for rows.Next() {
-		var book struct {
-			ID        uuid.UUID
-			Title     string
-			Available int
-		}
+		var book AvailableBook
 		if err := rows.Scan(&book.ID, &book.Title, &book.Available); err != nil {
-			c.JSON(500, gin.H{"error": "Something went wrong."})
-
+			c.JSON(500, gin.H{"error": "could not read book"})
+			return
 		}
 		books = append(books, book)
 	}
 
 	if err := rows.Err(); err != nil {
-		c.JSON(500, gin.H{"error": "Something went wrong."})
+		c.JSON(500, gin.H{"error": "could not fetch books"})
 		return
 	}
 
 	c.JSON(200, books)
-
 }
